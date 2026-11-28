@@ -10,7 +10,8 @@ clip, tìm đoạn ký hiệu (cổ tay, đo so với vai trong cùng khung, r�
 MIN_ACTIVE_S), rồi đặt cửa sổ quanh đoạn đó sao cho, giống tập ViSL, ký hiệu chiếm khoảng 22–23/30 khung với
 ~3 khung nghỉ trước và ~4 khung nghỉ sau,
 và lấy 30 khung cách đều theo thời gian (khung gần nhất, không nội suy, như prepare_visl.py). Nhờ vậy
-người làm chậm hay bắt đầu trễ vẫn có trọn ký hiệu. Ký hiệu chạm mép đầu/cuối clip thì loại (bị cắt).
+người làm chậm hay bắt đầu trễ vẫn có trọn ký hiệu. Cử động đã kết thúc trước lúc khung chuyển đỏ (nhích tay
+trong lúc đếm ngược) không tính là ký hiệu. Ký hiệu chạm mép đầu/cuối clip thì loại (bị cắt).
 --review ghi ảnh 30 khung đã chọn của mỗi lượt vào data/web_review/ để duyệt bằng mắt.
 
 Đầu ra:
@@ -166,8 +167,19 @@ def active_frames(a: np.ndarray, ts: np.ndarray) -> np.ndarray:
     return np.flatnonzero(keep)
 
 
-def extract_from_video(video: tuple[str, bytes], model: Path):
-    """Clip → (keypoints (30, 1662), tỉ lệ tay, người, mặt, thông tin đoạn cắt, ảnh 30 khung đã chọn) hoặc (lý do loại, info)."""
+def drop_before_red(on: np.ndarray, ts: np.ndarray, t_red: float | None) -> np.ndarray:
+    """Bỏ các đợt rời nghỉ đã kết thúc trước lúc khung chuyển đỏ (t_red, giây từ đầu clip): đó là người quay nhích
+    hay chỉnh tay trong lúc đếm ngược, không phải ký hiệu. Đợt bắt đầu sớm nhưng kéo dài qua khung đỏ vẫn giữ."""
+    if t_red is None or not len(on):
+        return on
+    runs = np.split(on, np.flatnonzero(np.diff(on) > 1) + 1)
+    kept = [r for r in runs if ts[r[-1]] >= t_red]
+    return np.concatenate(kept) if kept else on[:0]
+
+
+def extract_from_video(video: tuple[str, bytes], model: Path, t_red: float | None = None):
+    """Clip → (keypoints (30, 1662), tỉ lệ tay, người, mặt, thông tin đoạn cắt, ảnh 30 khung đã chọn) hoặc (lý do loại, info).
+    t_red: lúc khung chuyển đỏ (giây từ đầu clip), để bỏ cử động trong lúc đếm ngược; None nếu không biết."""
     frames, ts = read_video(*video)
     info = {"method": "video", "clip_s": f"{ts[-1]:.2f}" if len(ts) else "0"}
     if len(frames) < kp.SEQUENCE_LENGTH:
@@ -185,7 +197,7 @@ def extract_from_video(video: tuple[str, bytes], model: Path):
     a = activity(feats)
     if a is None:
         return "no_rest_pose", info
-    on = active_frames(a, ts)
+    on = drop_before_red(active_frames(a, ts), ts, t_red)
     if not len(on):
         return "no_sign", info
     t_on, t_off = ts[on[0]], ts[on[-1]]
@@ -258,7 +270,9 @@ def process(zip_path: Path, labels: dict[int, dict], data_dir: Path, args) -> di
 
     picked = None
     if video and not args.frames_only:
-        out, info = extract_from_video(video, Path(args.model))
+        times = (meta.get("video") or {}).get("frame_times_ms") or []
+        t_red = times[0] / 1000 if times else None   # ảnh đầu tiên được chụp đúng lúc khung chuyển đỏ
+        out, info = extract_from_video(video, Path(args.model), t_red)
         row.update(info)
         if isinstance(out, str):
             return {**row, "status": "rejected", "reason": out}
